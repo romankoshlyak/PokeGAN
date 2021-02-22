@@ -476,13 +476,12 @@ class DiscriminatorLatent(nn.Module):
         return last
 
 
-class AEGAN():
+class AEGAN(nn.Module):
     """An Autoencoder Generative Adversarial Network for making pokemon."""
 
     def __init__(self, latent_dim, noise_fn, dataloader,
                  batch_size=32, device='cpu'):
         """Initialize the AEGAN.
-
         Args:
             latent_dim: latent-space dimension. Must be divisible by 4.
             noise_fn: function f(num: int) -> pytorch tensor, (latent vectors)
@@ -490,6 +489,7 @@ class AEGAN():
             batch_size: training batch size. Must match that of dataloader
             device: cpu or CUDA
         """
+        super().__init__()
         assert latent_dim % 4 == 0
         self.latent_dim = latent_dim
         self.device = device

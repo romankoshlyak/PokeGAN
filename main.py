@@ -28,6 +28,24 @@ def save_images(GAN, vec, filename):
     image = Image.fromarray(ims)
     image.save(filename)
 
+def find_last_checkpoint():
+    last_file = None
+    check_dir = "results/checkpoints"
+    for filename in os.listdir(check_dir):
+        if filename.endswith(".pt") and (last_file is None or last_file < filename):
+            last_file = filename
+    if last_file is not None:
+        last_epoch = int(last_file.split('.')[1])
+        return os.path.join(check_dir, last_file), last_epoch
+    else:
+        return None, -1
+
+def load_checkpoint(model):
+    last_file, last_epoch = find_last_checkpoint()
+    print(f"Loading checkpoint {last_file}")
+    if last_file is not None:
+        model.load_state_dict(torch.load(last_file))
+    return last_epoch
 
 def main():
     os.makedirs("results/generated", exist_ok=True)
@@ -72,8 +90,9 @@ def main():
         device=device,
         batch_size=BATCH_SIZE,
         )
+    last_epoch = load_checkpoint(gan)
     start = time.time()
-    for i in range(EPOCHS):
+    for i in range(last_epoch+1, EPOCHS):
         while True:
             try:
                 with open("pause.json") as f:
@@ -86,14 +105,14 @@ def main():
                 break
         elapsed = int(time.time() - start)
         elapsed = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
-        print(f"Epoch {i+1}; Elapsed time = {elapsed}s")
+        print(f"Epoch {i}; Elapsed time = {elapsed}s")
         gan.train_epoch(max_steps=100)
-        if (i + 1) % 50 == 0:
+        if i > 0 and i % 50 == 0:
             torch.save(
-                gan.generator.state_dict(),
+                gan.state_dict(),
                 os.path.join("results", "checkpoints", f"gen.{i:05d}.pt"))
         save_images(gan, test_noise,
-            os.path.join("results", "generated", f"gen.{i:04d}.png"))
+            os.path.join("results", "generated", f"gen.{i:05d}.png"))
 
         with torch.no_grad():
             reconstructed = gan.generator(gan.encoder(test_ims.cuda())).cpu()
@@ -101,7 +120,7 @@ def main():
         reconstructed = reconstructed.numpy().transpose((1,2,0))
         reconstructed = np.array(reconstructed*255, dtype=np.uint8)
         reconstructed = Image.fromarray(reconstructed)
-        reconstructed.save(os.path.join("results", "reconstructed", f"gen.{i:04d}.png"))
+        reconstructed.save(os.path.join("results", "reconstructed", f"gen.{i:05d}.png"))
 
     images = gan.generate_samples()
     ims = tv.utils.make_grid(images, normalize=True)
