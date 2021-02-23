@@ -21,7 +21,7 @@ EPOCHS = 20000
 RESULTS_DIR = "results"
 CHECKPOINTS_DIR = os.path.join(RESULTS_DIR, "checkpoints")
 CHECKPOINTS_PERIOD = 50
-SAVE_IMAGES_PERIOD = 1
+SAVE_IMAGES_PERIOD = 10
 
 def save_images(GAN, vec, filename):
     images = GAN.generate_samples(vec)
@@ -69,8 +69,8 @@ def main():
             )
     dataloader = DataLoader(dataset,
             batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=8,
+            shuffle=True,
+            num_workers=2,
             drop_last=True
             )
     X = iter(dataloader)
@@ -101,7 +101,7 @@ def main():
         elapsed = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
         print(f"Epoch {i}; Elapsed time = {elapsed}s")
         gan.train_epoch()
-        if i % CHECKPOINTS_PERIOD == 0:
+        if i > 0 and i % CHECKPOINTS_PERIOD == 0:
             torch.save(
                 gan.state_dict(),
                 os.path.join(CHECKPOINTS_DIR, f"gen.{i:05d}.pt"))
