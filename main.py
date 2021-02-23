@@ -15,10 +15,13 @@ import numpy as np
 
 from aegan import AEGAN
 
-
 BATCH_SIZE = 32
 LATENT_DIM = 16
 EPOCHS = 20000
+RESULTS_DIR = "results"
+CHECKPOINTS_DIR = os.path.join(RESULTS_DIR, "checkpoints")
+CHECKPOINTS_PERIOD = 50
+SAVE_IMAGES_PERIOD = 1
 
 def save_images(GAN, vec, filename):
     images = GAN.generate_samples(vec)
@@ -30,13 +33,12 @@ def save_images(GAN, vec, filename):
 
 def find_last_checkpoint():
     last_file = None
-    check_dir = "results/checkpoints"
-    for filename in os.listdir(check_dir):
+    for filename in os.listdir(CHECKPOINTS_DIR):
         if filename.endswith(".pt") and (last_file is None or last_file < filename):
             last_file = filename
     if last_file is not None:
         last_epoch = int(last_file.split('.')[1])
-        return os.path.join(check_dir, last_file), last_epoch
+        return os.path.join(CHECKPOINTS_DIR, last_file), last_epoch
     else:
         return None, -1
 
@@ -67,14 +69,15 @@ def main():
             )
     dataloader = DataLoader(dataset,
             batch_size=BATCH_SIZE,
-            shuffle=True,
+            shuffle=False,
             num_workers=8,
             drop_last=True
             )
     X = iter(dataloader)
-    test_ims1, _ = next(X)
-    test_ims2, _ = next(X)
-    test_ims = torch.cat((test_ims1, test_ims2), 0)
+    test_ims, _ = next(X)
+    while len(test_ims) < 36:
+        test_ims2, _ = next(X)
+        test_ims = torch.cat((test_ims, test_ims2), 0)
     test_ims_show = tv.utils.make_grid(test_ims[:36], normalize=True, nrow=6,)
     test_ims_show = test_ims_show.numpy().transpose((1,2,0))
     test_ims_show = np.array(test_ims_show*255, dtype=np.uint8)
@@ -89,38 +92,31 @@ def main():
         dataloader,
         device=device,
         batch_size=BATCH_SIZE,
+        checkpoints_dir=CHECKPOINTS_DIR
         )
     last_epoch = load_checkpoint(gan)
     start = time.time()
     for i in range(last_epoch+1, EPOCHS):
-        while True:
-            try:
-                with open("pause.json") as f:
-                    pause = json.load(f)
-                if pause['pause'] == 0:
-                    break
-                print(f"Pausing for {pause['pause']} seconds")
-                time.sleep(pause["pause"])
-            except (KeyError, json.decoder.JSONDecodeError, FileNotFoundError):
-                break
         elapsed = int(time.time() - start)
         elapsed = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
         print(f"Epoch {i}; Elapsed time = {elapsed}s")
-        gan.train_epoch(max_steps=100)
-        if i > 0 and i % 50 == 0:
+        gan.train_epoch()
+        if i % CHECKPOINTS_PERIOD == 0:
             torch.save(
                 gan.state_dict(),
-                os.path.join("results", "checkpoints", f"gen.{i:05d}.pt"))
-        save_images(gan, test_noise,
-            os.path.join("results", "generated", f"gen.{i:05d}.png"))
+                os.path.join(CHECKPOINTS_DIR, f"gen.{i:05d}.pt"))
 
-        with torch.no_grad():
-            reconstructed = gan.generator(gan.encoder(test_ims.cuda())).cpu()
-        reconstructed = tv.utils.make_grid(reconstructed[:36], normalize=True, nrow=6,)
-        reconstructed = reconstructed.numpy().transpose((1,2,0))
-        reconstructed = np.array(reconstructed*255, dtype=np.uint8)
-        reconstructed = Image.fromarray(reconstructed)
-        reconstructed.save(os.path.join("results", "reconstructed", f"gen.{i:05d}.png"))
+        if i % SAVE_IMAGES_PERIOD == 0:
+            save_images(gan, test_noise,
+                os.path.join("results", "generated", f"gen.{i:05d}.png"))
+
+            with torch.no_grad():
+                reconstructed = gan.generator(gan.encoder(test_ims.cuda())).cpu()
+            reconstructed = tv.utils.make_grid(reconstructed[:36], normalize=True, nrow=6,)
+            reconstructed = reconstructed.numpy().transpose((1,2,0))
+            reconstructed = np.array(reconstructed*255, dtype=np.uint8)
+            reconstructed = Image.fromarray(reconstructed)
+            reconstructed.save(os.path.join("results", "reconstructed", f"gen.{i:05d}.png"))
 
     images = gan.generate_samples()
     ims = tv.utils.make_grid(images, normalize=True)

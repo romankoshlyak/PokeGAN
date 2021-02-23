@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 from PIL import Image
 import numpy as np
 
-EPS = 1e-6
 ALPHA_RECONSTRUCT_IMAGE = 1
 ALPHA_RECONSTRUCT_LATENT = 0.5
 ALPHA_DISCRIMINATE_IMAGE = 0.005
@@ -480,7 +479,7 @@ class AEGAN(nn.Module):
     """An Autoencoder Generative Adversarial Network for making pokemon."""
 
     def __init__(self, latent_dim, noise_fn, dataloader,
-                 batch_size=32, device='cpu'):
+                 batch_size=32, device='cpu', checkpoints_dir = None):
         """Initialize the AEGAN.
         Args:
             latent_dim: latent-space dimension. Must be divisible by 4.
@@ -496,6 +495,7 @@ class AEGAN(nn.Module):
         self.noise_fn = noise_fn
         self.dataloader = dataloader
         self.batch_size = batch_size
+        self.checkpoints_dir = checkpoints_dir
 
         self.criterion_gen = nn.BCELoss()
         self.criterion_recon_image = nn.L1Loss()
@@ -558,6 +558,9 @@ class AEGAN(nn.Module):
         samples = samples.cpu()  # move images to cpu
         return samples
 
+    def calc_gen_losses(self, X, Z):
+        pass
+
     def train_step_generators(self, X):
         """Train the generator one step and return the loss."""
         self.generator.zero_grad()
@@ -580,12 +583,12 @@ class AEGAN(nn.Module):
         X_tilde_loss = self.criterion_gen(X_tilde_confidence, self.target_ones)
         Z_tilde_loss = self.criterion_gen(Z_tilde_confidence, self.target_ones)
 
-        X_recon_loss = self.criterion_recon_image(X_tilde, X) * ALPHA_RECONSTRUCT_IMAGE
-        Z_recon_loss = self.criterion_recon_latent(Z_tilde, Z) * ALPHA_RECONSTRUCT_LATENT
+        X_recon_loss = self.criterion_recon_image(X_tilde, X)
+        Z_recon_loss = self.criterion_recon_latent(Z_tilde, Z)
 
-        X_loss = (X_hat_loss + X_tilde_loss) / 2 * ALPHA_DISCRIMINATE_IMAGE
-        Z_loss = (Z_hat_loss + Z_tilde_loss) / 2 * ALPHA_DISCRIMINATE_LATENT
-        loss = X_loss + Z_loss + X_recon_loss + Z_recon_loss
+        X_loss = (X_hat_loss + X_tilde_loss) / 2
+        Z_loss = (Z_hat_loss + Z_tilde_loss) / 2
+        loss = X_loss * ALPHA_DISCRIMINATE_IMAGE + Z_loss * ALPHA_DISCRIMINATE_LATENT + X_recon_loss * ALPHA_RECONSTRUCT_IMAGE + Z_recon_loss * ALPHA_RECONSTRUCT_LATENT
 
         loss.backward()
         self.optim_e.step()
@@ -630,16 +633,10 @@ class AEGAN(nn.Module):
 
         return loss_images.item(), loss_latent.item()
 
-    def train_epoch(self, print_frequency=1, max_steps=0):
+    def train_epoch(self):
         """Train both networks for one epoch and return the losses.
-
-        Args:
-            print_frequency (int): print stats every `print_frequency` steps.
-            max_steps (int): End epoch after `max_steps` steps, or set to 0
-                             to do the full epoch.
         """
         ldx, ldz, lgx, lgz, lrx, lrz = 0, 0, 0, 0, 0, 0
-        eps = 1e-9
         for batch, (real_samples, _) in enumerate(self.dataloader):
             real_samples = real_samples.to(self.device)
             ldx_, ldz_ = self.train_step_discriminators(real_samples)
@@ -650,24 +647,14 @@ class AEGAN(nn.Module):
             lgz += lgz_
             lrx += lrx_
             lrz += lrz_
-            if print_frequency and (batch+1) % print_frequency == 0:
-                print(f"{batch+1}/{len(self.dataloader)}:"
-                      f" G={lgx / (eps + (batch+1) * ALPHA_DISCRIMINATE_IMAGE):.3f},"
-                      f" E={lgz / (eps + (batch+1) * ALPHA_DISCRIMINATE_LATENT):.3f},"
-                      f" Dx={ldx / (eps + (batch+1)):.3f},"
-                      f" Dz={ldz / (eps + (batch+1)):.3f}",
-                      f" Rx={lrx / (eps + (batch+1) * ALPHA_RECONSTRUCT_IMAGE):.3f}",
-                      f" Rz={lrz / (eps + (batch+1) * ALPHA_RECONSTRUCT_LATENT):.3f}",
-                      end='\r',
-                      flush=True)
-            if max_steps and batch == max_steps:
-                break
-        if print_frequency:
-            print()
-        lgx /= batch
-        lgz /= batch
-        ldx /= batch
-        ldz /= batch
-        lrx /= batch
-        lrz /= batch
-        return lgx, lgz, ldx, ldz, lrx, lrz
+
+        n = len(self.dataloader)
+        lgx /= n
+        lgz /= n
+        ldx /= n
+        ldz /= n
+        lrx /= n
+        lrz /= n
+
+        print(f"Gx={lgx:.4f}, Gz={lgz:.4f}, Dx={ldx:.3f}, Dz={ldz:.3f} Rx={lrx:.3f} Rz={lrz:.3f}")
+
