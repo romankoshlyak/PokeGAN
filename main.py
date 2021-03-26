@@ -1,3 +1,4 @@
+import argparse
 import os
 import json
 import sys
@@ -14,17 +15,58 @@ from PIL import Image
 import numpy as np
 
 from aegan import AEGAN
+from aegan import ImageCache
 
 BATCH_SIZE = 32
 LATENT_DIM = 16
-EPOCHS = 20000
+EPOCHS = 200000
 RESULTS_DIR = "results"
 CHECKPOINTS_DIR = os.path.join(RESULTS_DIR, "checkpoints")
-CHECKPOINTS_PERIOD = 50
+CHECKPOINTS_PERIOD = 200
 SAVE_IMAGES_PERIOD = 10
 
+def save_img(image, filename):
+    image = (image + 1) / 2.0
+    just_save_img(image, filename)
+
+def just_save_img(image, filename):
+    if filename is not None:
+        image = np.array(image*255, dtype=np.uint8)
+        image = Image.fromarray(image)
+        image.save(filename)
+
+def gen_images(GAN, noise_fn, seed = 1, save_index = -1, filename = None):
+    torch.manual_seed(seed)
+    vec = noise_fn(100)
+    images, confidence = GAN.generate_samples(vec)
+    if filename is not None:
+        filename = os.path.join(RESULTS_DIR, filename)
+    if save_index == -1:
+        ims = tv.utils.make_grid(images, normalize=True, nrow=10)
+        fig = plt.figure(figsize=(16, 16), frameon=False)
+        ax = fig.add_axes([0, 0, 1, 1])
+        plt.axis('off')
+        ax.imshow(ims.numpy().transpose((1,2,0)))
+        plt.show()
+    else:
+        save_img(images[save_index], filename)
+
+def load_gan():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    noise_fn = lambda x: torch.randn((x, LATENT_DIM), device=device)
+    gan = AEGAN(
+        LATENT_DIM,
+        noise_fn,
+        None,
+        device=device,
+        batch_size=BATCH_SIZE,
+        checkpoints_dir=CHECKPOINTS_DIR
+        )
+    load_checkpoint(gan)
+    return gan, noise_fn
+
 def save_images(GAN, vec, filename):
-    images = GAN.generate_samples(vec)
+    images, confidence = GAN.generate_samples(vec)
     ims = tv.utils.make_grid(images[:36], normalize=True, nrow=6,)
     ims = ims.numpy().transpose((1,2,0))
     ims = np.array(ims*255, dtype=np.uint8)
@@ -49,6 +91,13 @@ def load_checkpoint(model):
         model.load_state_dict(torch.load(last_file))
     return last_epoch
 
+class Transform2Times(object):
+    def __init__(self, transform):
+        self.transform = transform
+
+    def __call__(self, sample):
+        return [self.transform(sample), self.transform(sample)]
+
 def main():
     os.makedirs("results/generated", exist_ok=True)
     os.makedirs("results/reconstructed", exist_ok=True)
@@ -57,7 +106,7 @@ def main():
     root = os.path.join("data")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     transform = tv.transforms.Compose([
-            tv.transforms.RandomAffine(0, translate=(5/96, 5/96), fillcolor=(255,255,255)),
+            tv.transforms.RandomAffine(0, translate=(5/96, 5/96), fill=(255,255,255)),
             tv.transforms.ColorJitter(hue=0.5),
             tv.transforms.RandomHorizontalFlip(p=0.5),
             tv.transforms.ToTensor(),
@@ -65,7 +114,7 @@ def main():
             ])
     dataset = ImageFolder(
             root=root,
-            transform=transform
+            transform=Transform2Times(transform)
             )
     dataloader = DataLoader(dataset,
             batch_size=BATCH_SIZE,
@@ -74,9 +123,9 @@ def main():
             drop_last=True
             )
     X = iter(dataloader)
-    test_ims, _ = next(X)
+    [test_ims, _], _ = next(X)
     while len(test_ims) < 36:
-        test_ims2, _ = next(X)
+        [test_ims2, _], _ = next(X)
         test_ims = torch.cat((test_ims, test_ims2), 0)
     test_ims_show = tv.utils.make_grid(test_ims[:36], normalize=True, nrow=6,)
     test_ims_show = test_ims_show.numpy().transpose((1,2,0))
@@ -94,13 +143,14 @@ def main():
         batch_size=BATCH_SIZE,
         checkpoints_dir=CHECKPOINTS_DIR
         )
+    cache = ImageCache(BATCH_SIZE*4*1024)
     last_epoch = load_checkpoint(gan)
     start = time.time()
     for i in range(last_epoch+1, EPOCHS):
         elapsed = int(time.time() - start)
         elapsed = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
         print(f"Epoch {i}; Elapsed time = {elapsed}s")
-        gan.train_epoch()
+        gan.train_epoch(cache)
         if i > 0 and i % CHECKPOINTS_PERIOD == 0:
             torch.save(
                 gan.state_dict(),
@@ -122,7 +172,6 @@ def main():
     ims = tv.utils.make_grid(images, normalize=True)
     plt.imshow(ims.numpy().transpose((1,2,0)))
     plt.show()
-
 
 if __name__ == "__main__":
     main()

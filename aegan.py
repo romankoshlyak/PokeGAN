@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import time
+import copy
 
 import torch
 from torch import nn
@@ -12,10 +13,32 @@ from torch.utils.data import DataLoader
 from PIL import Image
 import numpy as np
 
-ALPHA_RECONSTRUCT_IMAGE = 1
-ALPHA_RECONSTRUCT_LATENT = 0.5
-ALPHA_DISCRIMINATE_IMAGE = 0.005
-ALPHA_DISCRIMINATE_LATENT = 0.1
+ALPHA_COPY_IMAGE = 1.0
+ALPHA_RECONSTRUCT_IMAGE = 0.0
+ALPHA_RECONSTRUCT_LATENT = 1.0
+ALPHA_DISCRIMINATE_IMAGE = 1.0
+ALPHA_DISCRIMINATE_LATENT = 1.0
+
+class ImageCache(object):
+    def __init__(self, cache_size):
+        self.cache_size = cache_size
+        self.used_size = 0
+        self.cache = None
+
+    def add_images(self, images):
+        images = images.cpu()
+        if self.cache is None:
+            self.cache = images[0:1].expand(self.cache_size, -1, -1, -1).clone()
+        add_size = min(images.size(0), self.cache_size-self.used_size)
+        insert_size = images.size(0)-add_size
+        if add_size > 0:
+            self.cache[self.used_size:self.used_size+add_size] = images
+            self.used_size += add_size
+        if insert_size > 0:
+            self.cache[torch.randperm(self.cache_size)[:insert_size]] = images[images.size(0)-insert_size:].clone()
+
+    def get_images(self, size):
+        return self.cache[torch.randperm(self.used_size)[:size]]
 
 class Generator(nn.Module):
     """A generator for mapping a latent space to a sample space.
@@ -381,17 +404,19 @@ class DiscriminatorImage(nn.Module):
     Output shape: (?, 1)
     """
 
-    def __init__(self, device="cpu"):
+    def __init__(self, input_channels = 3, device="cpu"):
         """Initialize the discriminator."""
         super().__init__()
         self.device = device
-        self._init_modules()
+        self._init_modules(input_channels)
 
-    def _init_modules(self):
+    def _init_modules(self, input_channels):
         """Initialize the modules."""
-        down_channels = [3, 64, 128, 256, 512]
+        mult = 1
+        down_channels = [input_channels, 64*mult, 128*mult, 256*mult, 512*mult]
         self.down = nn.ModuleList()
         leaky_relu = nn.LeakyReLU()
+        self.drop = nn.Dropout2d(p=0.2)
         for i in range(4):
             self.down.append(
                 nn.Conv2d(
@@ -413,12 +438,13 @@ class DiscriminatorImage(nn.Module):
 
     def forward(self, input_tensor):
         """Forward pass; map latent vectors to samples."""
-        rv = torch.randn(input_tensor.size(), device=self.device) * 0.02
-        intermediate = input_tensor + rv
+        #rv = torch.randn(input_tensor.size(), device=self.device) * 0.02
+        intermediate = input_tensor# + rv
         for module in self.down:
             intermediate = module(intermediate)
-            rv = torch.randn(intermediate.size(), device=self.device) * 0.02 + 1
-            intermediate *= rv
+            intermediate = self.drop(intermediate)
+            #rv = torch.randn(intermediate.size(), device=self.device) * 0.02 + 1
+            #intermediate *= rv
 
         intermediate = intermediate.view(-1, self.width)
 
@@ -474,6 +500,20 @@ class DiscriminatorLatent(nn.Module):
             last = module(last)
         return last
 
+class DetailsInfo(object):
+    def __init__(self):
+        self.data = {}
+    def log(self, key, value, mult = 1):
+        key_parts = key.split('_')
+        for part_ind in range(len(key_parts)):
+            sub_key = '_'.join(key_parts[:part_ind+1])
+            for _ in range(mult):
+                self.data.setdefault(part_ind, {}).setdefault(sub_key, []).append(value.item())
+
+    def printStats(self, level):
+        data = self.data.setdefault(level, {})
+        for key in sorted(data.keys()):
+            print(key, np.array(data[key]).mean())
 
 class AEGAN(nn.Module):
     """An Autoencoder Generative Adversarial Network for making pokemon."""
@@ -526,15 +566,18 @@ class AEGAN(nn.Module):
         self.optim_di = optim.Adam(self.discriminator_image.parameters(),
                                    lr=1e-4, betas=(0.5, 0.999),
                                    weight_decay=1e-8)
+        self.discriminator_image2 = DiscriminatorImage(input_channels = 6, device=self.device).to(self.device)
+        self.optim_di2 = optim.Adam(self.discriminator_image2.parameters(),
+                                   lr=1e-4, betas=(0.5, 0.999),
+                                   weight_decay=1e-8)
 
     def _init_dz(self):
         self.discriminator_latent = DiscriminatorLatent(
             latent_dim=self.latent_dim,
             device=self.device,
             ).to(self.device)
-        self.optim_dl = optim.Adam(self.discriminator_latent.parameters(),
-                                   lr=1e-4, betas=(0.5, 0.999),
-                                   weight_decay=1e-8)
+        self.optim_dl = optim.SGD(self.discriminator_latent.parameters(),
+                                   lr=1e-3)
 
 
     def generate_samples(self, latent_vec=None, num=None):
@@ -555,11 +598,70 @@ class AEGAN(nn.Module):
         latent_vec = self.noise_fn(num) if latent_vec is None else latent_vec
         with torch.no_grad():
             samples = self.generator(latent_vec)
+            confidence = self.discriminator_image(samples)
         samples = samples.cpu()  # move images to cpu
-        return samples
+        return samples, confidence
 
-    def calc_gen_losses(self, X, Z):
-        pass
+    def get_model_files(self):
+        model_files = []
+        for filename in os.listdir(self.checkpoints_dir):
+            if filename.endswith(".pt"):
+                model_files.append(filename)
+
+        return [os.path.join(self.checkpoints_dir, model_file) for model_file in sorted(model_files)]
+    
+    def calc_discriminators_stats(self, X, X_transformed, model, details_info):
+        with torch.no_grad():
+            Z = self.noise_fn(self.batch_size)
+            X_hat = self.generator(Z)
+            Z_hat = self.encoder(X)
+            X_tilde = self.generator(Z_hat)
+            Z_tilde = self.encoder(X_hat)
+
+            X_copy = torch.cat((X, X_transformed), dim=1)
+            X_copy_rolled = torch.cat((X, torch.roll(X_transformed, 1, 0)), dim=1)
+            X_copy_tilde = torch.cat((X, X_tilde), dim=1)
+            X_copy_tilde_rolled = torch.cat((X, torch.roll(X_tilde, 1, 0)), dim=1)
+
+            X_copy_confidence = model.discriminator_image2(X_copy)
+            X_not_copy_confidence = model.discriminator_image2(X_copy_rolled)
+            X_copy_tilde_confidence = model.discriminator_image2(X_copy_tilde)
+            X_not_copy_tilde_confidence = model.discriminator_image2(X_copy_tilde_rolled)
+
+            X_copy_loss = self.criterion_gen(X_copy_confidence, self.target_ones)
+            X_not_copy_loss = self.criterion_gen(X_not_copy_confidence, self.target_zeros)
+            X_copy_tilde_loss = self.criterion_gen(X_copy_tilde_confidence, self.target_zeros)
+            X_not_copy_tilde_loss = self.criterion_gen(X_not_copy_tilde_confidence, self.target_zeros)
+            details_info.log('discImageCopyLoss_Copy', X_copy_loss)
+            details_info.log('discImageCopyLoss_NotCopy', X_not_copy_loss)
+            details_info.log('discImageCopyLoss_TildeCopy', X_copy_tilde_loss)
+            details_info.log('discImageCopyLoss_TildeNotCopy', X_not_copy_tilde_loss)
+
+            X_confidence = model.discriminator_image(X)
+            X_hat_confidence = model.discriminator_image(X_hat)
+            X_tilde_confidence = model.discriminator_image(X_tilde)
+
+            discImageLoss_X = self.criterion_gen(X_confidence, self.target_ones)
+            discImageLoss_XHat = self.criterion_gen(X_hat_confidence, self.target_zeros)
+            discImageLoss_XTilde = self.criterion_gen(X_tilde_confidence, self.target_zeros)
+            details_info.log('discImageLoss_X', discImageLoss_X, 2)
+            details_info.log('discImageLoss_XHat', discImageLoss_XHat)
+            details_info.log('discImageLoss_XTilde', discImageLoss_XTilde)
+ 
+    def calc_gen_losses(self):
+        model_files = self.get_model_files()
+        for model_file in model_files:
+            model = copy.copy(self)
+            model.load_state_dict(torch.load(model_file))
+            details_info = DetailsInfo()
+            for batch, (real_samples, _) in enumerate(self.dataloader):
+                real_samples, real_samples_transformed = real_samples
+                real_samples = real_samples.to(self.device)
+                real_samples_transformed = real_samples_transformed.to(self.device)
+                self.calc_discriminators_stats(real_samples, real_samples_transformed, model, details_info)
+            print(model_file)
+            details_info.printStats(0)
+            details_info.printStats(1)
 
     def train_step_generators(self, X):
         """Train the generator one step and return the loss."""
@@ -573,11 +675,24 @@ class AEGAN(nn.Module):
         X_tilde = self.generator(Z_hat)
         Z_tilde = self.encoder(X_hat)
 
+        X_copy_tilde = torch.cat((X, X_tilde), dim=1)
+        X_copy_tilde_rolled = torch.cat((X, torch.roll(X_tilde, 1, 0)), dim=1)
+
+        #self.discriminator_image.eval()
+        #self.discriminator_image2.eval()
+        #self.discriminator_latent.eval()
+        X_copy_tilde_confidence = self.discriminator_image2(X_copy_tilde)
+        X_not_copy_tilde_confidence = self.discriminator_image2(X_copy_tilde_rolled)
         X_hat_confidence = self.discriminator_image(X_hat)
         Z_hat_confidence = self.discriminator_latent(Z_hat)
         X_tilde_confidence = self.discriminator_image(X_tilde)
         Z_tilde_confidence = self.discriminator_latent(Z_tilde)
+        #self.discriminator_image.train()
+        #self.discriminator_image2.train()
+        #self.discriminator_latent.train()
 
+        X_copy_tilde_loss = self.criterion_gen(X_copy_tilde_confidence, self.target_ones)
+        X_not_copy_tilde_loss = self.criterion_gen(X_not_copy_tilde_confidence, self.target_zeros)
         X_hat_loss = self.criterion_gen(X_hat_confidence, self.target_ones)
         Z_hat_loss = self.criterion_gen(Z_hat_confidence, self.target_ones)
         X_tilde_loss = self.criterion_gen(X_tilde_confidence, self.target_ones)
@@ -588,7 +703,8 @@ class AEGAN(nn.Module):
 
         X_loss = (X_hat_loss + X_tilde_loss) / 2
         Z_loss = (Z_hat_loss + Z_tilde_loss) / 2
-        loss = X_loss * ALPHA_DISCRIMINATE_IMAGE + Z_loss * ALPHA_DISCRIMINATE_LATENT + X_recon_loss * ALPHA_RECONSTRUCT_IMAGE + Z_recon_loss * ALPHA_RECONSTRUCT_LATENT
+        loss_copy = (X_copy_tilde_loss + X_not_copy_tilde_loss) / 2
+        loss = loss_copy * ALPHA_COPY_IMAGE + X_loss * ALPHA_DISCRIMINATE_IMAGE + Z_loss * ALPHA_DISCRIMINATE_LATENT + X_recon_loss * ALPHA_RECONSTRUCT_IMAGE + Z_recon_loss * ALPHA_RECONSTRUCT_LATENT
 
         loss.backward()
         self.optim_e.step()
@@ -596,52 +712,84 @@ class AEGAN(nn.Module):
 
         return X_loss.item(), Z_loss.item(), X_recon_loss.item(), Z_recon_loss.item()
 
-    def train_step_discriminators(self, X):
+    def train_step_discriminators(self, X, X_transformed, cache):
         """Train the discriminator one step and return the losses."""
+        X_copy = torch.cat((X, X_transformed), dim=1)
+        X_copy_rolled = torch.cat((X, torch.roll(X_transformed, 1, 0)), dim=1)
         self.discriminator_image.zero_grad()
+        self.discriminator_image2.zero_grad()
         self.discriminator_latent.zero_grad()
 
         Z = self.noise_fn(self.batch_size)
 
         with torch.no_grad():
             X_hat = self.generator(Z)
+            cache.add_images(X_hat)
             Z_hat = self.encoder(X)
             X_tilde = self.generator(Z_hat)
+            #cache.add_images(X_tilde)
             Z_tilde = self.encoder(X_hat)
+            X_mem = cache.get_images(self.batch_size).to(self.device)
+        
+        X_copy_tilde = torch.cat((X, X_tilde), dim=1)
+        X_copy_tilde_rolled = torch.cat((X, torch.roll(X_tilde, 1, 0)), dim=1)
+
+        X_copy_confidence = self.discriminator_image2(X_copy)
+        X_not_copy_confidence = self.discriminator_image2(X_copy_rolled)
+        X_copy_tilde_confidence = self.discriminator_image2(X_copy_tilde)
+        X_not_copy_tilde_confidence = self.discriminator_image2(X_copy_tilde_rolled)
 
         X_confidence = self.discriminator_image(X)
         X_hat_confidence = self.discriminator_image(X_hat)
         X_tilde_confidence = self.discriminator_image(X_tilde)
+        X_mem_confidence = self.discriminator_image(X_mem)
         Z_confidence = self.discriminator_latent(Z)
         Z_hat_confidence = self.discriminator_latent(Z_hat)
         Z_tilde_confidence = self.discriminator_latent(Z_tilde)
 
-        X_loss = 2 * self.criterion_gen(X_confidence, self.target_ones)
+        X_copy_loss = self.criterion_gen(X_copy_confidence, self.target_ones)
+        X_not_copy_loss = self.criterion_gen(X_not_copy_confidence, self.target_zeros)
+        X_copy_tilde_loss = self.criterion_gen(X_copy_tilde_confidence, self.target_zeros)
+        X_not_copy_tilde_loss = self.criterion_gen(X_not_copy_tilde_confidence, self.target_zeros)
+
+        X_loss = self.criterion_gen(X_confidence, self.target_ones)
         X_hat_loss = self.criterion_gen(X_hat_confidence, self.target_zeros)
         X_tilde_loss = self.criterion_gen(X_tilde_confidence, self.target_zeros)
+        X_mem_loss = self.criterion_gen(X_mem_confidence, self.target_zeros)
         Z_loss = 2 * self.criterion_gen(Z_confidence, self.target_ones)
         Z_hat_loss = self.criterion_gen(Z_hat_confidence, self.target_zeros)
         Z_tilde_loss = self.criterion_gen(Z_tilde_confidence, self.target_zeros)
 
-        loss_images = (X_loss + X_hat_loss + X_tilde_loss) / 4
+        loss_copy = (3*X_copy_loss + X_not_copy_loss + X_copy_tilde_loss + X_not_copy_tilde_loss) / 6
+        loss_images = (3*X_loss + X_hat_loss + X_tilde_loss + X_mem_loss) / 6
         loss_latent = (Z_loss + Z_hat_loss + Z_tilde_loss) / 4
-        loss = loss_images + loss_latent
+        loss = loss_copy + loss_images + loss_latent
 
         loss.backward()
+        self.optim_di2.step()
         self.optim_di.step()
         self.optim_dl.step()
 
-        return loss_images.item(), loss_latent.item()
+        return loss_images.item(), loss_latent.item(), loss_copy.item(), np.array([X_loss.item(), X_hat_loss.item(), X_tilde_loss.item(), X_mem_loss.item(), X_copy_loss.item(), X_not_copy_loss.item(), X_copy_tilde_loss.item(), X_not_copy_tilde_loss.item()])
 
-    def train_epoch(self):
+    def train_epoch(self, cache):
         """Train both networks for one epoch and return the losses.
         """
         ldx, ldz, lgx, lgz, lrx, lrz = 0, 0, 0, 0, 0, 0
+        ldxc = 0
+        details = None
         for batch, (real_samples, _) in enumerate(self.dataloader):
+            real_samples, real_samples_transformed = real_samples
             real_samples = real_samples.to(self.device)
-            ldx_, ldz_ = self.train_step_discriminators(real_samples)
+            real_samples_transformed = real_samples_transformed.to(self.device)
+            ldx_, ldz_, ldxc_, details_ = self.train_step_discriminators(real_samples, real_samples_transformed, cache)
             ldx += ldx_
             ldz += ldz_
+            ldxc += ldxc_
+            if details is None:
+                details = details_
+            else:
+                details += details_
             lgx_, lgz_, lrx_, lrz_ = self.train_step_generators(real_samples)
             lgx += lgx_
             lgz += lgz_
@@ -656,5 +804,9 @@ class AEGAN(nn.Module):
         lrx /= n
         lrz /= n
 
-        print(f"Gx={lgx:.4f}, Gz={lgz:.4f}, Dx={ldx:.3f}, Dz={ldz:.3f} Rx={lrx:.3f} Rz={lrz:.3f}")
+        ldxc /= n
+        details /= n
+
+        print(f"Gx={lgx:.4f}, Gz={lgz:.4f}, Dx={ldx:.3f}, Dz={ldz:.3f} Rx={lrx:.3f} Rz={lrz:.3f} DxCopy={ldxc:.3f}")
+        print(details)
 
